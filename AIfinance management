@@ -1,1 +1,118 @@
 This is Ai based finanace management system which helps users to keep track of the monthly expenses and give insights based on the past data on how they can sava for future.
+
+from flask import Flask, jsonify, request
+import sqlite3
+import dash
+import dash_core_components as dcc
+import dash_html_components as html
+from dash.dependencies import Input, Output
+import pandas as pd
+import plotly.express as px
+from flask_cors import CORS
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+
+app = Flask(__name__)
+CORS(app)
+app.config['JWT_SECRET_KEY'] = 'your_secret_key'
+jwt = JWTManager(app)
+bcrypt = Bcrypt(app)
+db_name = 'finance.db'
+
+def init_db():
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT UNIQUE,
+                        password TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS transactions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        category TEXT,
+                        amount REAL,
+                        type TEXT,  -- 'income' or 'expense'
+                        date TEXT,
+                        FOREIGN KEY(user_id) REFERENCES users(id))''')
+    conn.commit()
+    conn.close()
+
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    username, password = data['username'], data['password']
+    hashed_pw = bcrypt.generate_password_hash(password).decode('utf-8')
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed_pw))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"message": "Username already exists"}), 400
+    conn.close()
+    return jsonify({"message": "User registered successfully"})
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    username, password = data['username'], data['password']
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, password FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    conn.close()
+    if user and bcrypt.check_password_hash(user[1], password):
+        token = create_access_token(identity=user[0])
+        return jsonify({"token": token})
+    return jsonify({"message": "Invalid credentials"}), 401
+
+@app.route('/add_transaction', methods=['POST'])
+@jwt_required()
+def add_transaction():
+    user_id = get_jwt_identity()
+    data = request.json
+    category, amount, trans_type, date = data['category'], data['amount'], data['type'], data['date']
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO transactions (user_id, category, amount, type, date) VALUES (?, ?, ?, ?, ?)", 
+                   (user_id, category, amount, trans_type, date))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "Transaction added successfully"})
+
+@app.route('/get_transactions', methods=['GET'])
+@jwt_required()
+def get_transactions():
+    user_id = get_jwt_identity()
+    conn = sqlite3.connect(db_name)
+    df = pd.read_sql_query("SELECT * FROM transactions WHERE user_id = ?", conn, params=(user_id,))
+    conn.close()
+    return df.to_json(orient='records')
+
+dash_app = dash.Dash(__name__, server=app, url_base_pathname='/dashboard/')
+
+def get_data(user_id):
+    conn = sqlite3.connect(db_name)
+    df = pd.read_sql_query("SELECT * FROM transactions WHERE user_id = ?", conn, params=(user_id,))
+    conn.close()
+    return df
+
+dash_app.layout = html.Div([
+    html.H1("Finance Dashboard"),
+    dcc.Graph(id='expense-chart'),
+    dcc.Interval(id='interval-update', interval=5000, n_intervals=0)
+])
+
+@dash_app.callback(Output('expense-chart', 'figure'), [Input('interval-update', 'n_intervals')])
+@jwt_required()
+def update_chart(n):
+    user_id = get_jwt_identity()
+    df = get_data(user_id)
+    if df.empty:
+        return px.bar(title="No transactions available")
+    fig = px.pie(df, names='category', values='amount', title="Expenses by Category")
+    return fig
+
+if __name__ == '__main__':
+    init_db()
+    app.run(debug=True)
